@@ -1,5 +1,5 @@
 #
-# StarPy -- Asterisk Protocols for Twisted
+# StarPy -- Asterisk Protocols for asyncio
 #
 # Copyright (c) 2006, Michael C. Fletcher
 #
@@ -25,9 +25,8 @@ the server is listening.
 
 Module defines a standard Python logging module log 'FastAGI'
 """
-from twisted.internet import protocol, reactor, defer
-from twisted.internet import error as tw_error
-from twisted.protocols import basic
+from starpy._async import protocol, reactor, defer, basic
+from starpy._async import error as tw_error
 import logging
 import time
 from starpy import error
@@ -116,7 +115,7 @@ class FastAGIProtocol(basic.LineOnlyReceiver):
         return self.lostConnectionDeferred
 
     def lineReceived(self, line):
-        """(Internal) Handle Twisted's report of an incoming line from AMI"""
+        """(Internal) Handle an incoming line from AMI"""
         line = line.decode("utf-8")
         log.debug('Line In: %r', line)
         if self.readingVariables:

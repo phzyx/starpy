@@ -1,5 +1,5 @@
 #
-# StarPy -- Asterisk Protocols for Twisted
+# StarPy -- Asterisk Protocols for asyncio
 #
 # Copyright (c) 2006, Michael C. Fletcher
 #
@@ -14,7 +14,7 @@
 # BSD 3-Clause License. See the LICENSE file at the top of the source tree for
 # details.
 
-"""Asterisk Manager Interface for the Twisted networking framework
+"""Asterisk Manager Interface built on Python asyncio
 
 The Asterisk Manager Interface is a simple line-oriented protocol that allows
 for basic control of the channels active on a given Asterisk server.
@@ -23,9 +23,8 @@ Module defines a standard Python logging module log 'AMI'
 """
 
 import sys
-from twisted.internet import protocol, reactor, defer
-from twisted.protocols import basic
-from twisted.internet import error as tw_error
+from starpy._async import protocol, reactor, defer, basic
+from starpy._async import error as tw_error
 import socket
 import logging
 from hashlib import md5
@@ -167,7 +166,7 @@ class AMIProtocol(basic.LineOnlyReceiver):
         return success
 
     def lineReceived(self, line):
-        """Handle Twisted's report of an incoming line from the manager"""
+        """Handle an incoming line from the manager"""
         line = line.decode("utf-8")
         log.debug('Line In: %r', line)
         self.messageCache.append(line)
@@ -177,10 +176,10 @@ class AMIProtocol(basic.LineOnlyReceiver):
     def connectionMade(self):
         """Handle connection to the AMI port (auto-login)
 
-        This is a Twisted customisation point, we use it to automatically
+        This is a connection-made customisation point, we use it to automatically
         log into the connection we've just established.
 
-        XXX Should probably use proper Twisted-style credential negotiations
+        XXX Should probably use proper async credential negotiations
         """
         log.info('Connection Made')
         self.factory.resetDelay()
@@ -217,7 +216,11 @@ class AMIProtocol(basic.LineOnlyReceiver):
 
     def connectionLost(self, reason):
         """Connection lost, clean up callbacks"""
-        for key, callable in self.actionIDCallbacks.items():
+        # A Deferred callback commonly removes its own action ID via cleanup().
+        # Iterate over a snapshot so one callback cannot invalidate the live
+        # dict iterator and prevent the remaining pending actions (and the
+        # connection-lost/reconnect path) from being notified.
+        for key, callable in list(self.actionIDCallbacks.items()):
             try:
                 callable(tw_error.ConnectionDone(
                          "FastAGI connection terminated"))
