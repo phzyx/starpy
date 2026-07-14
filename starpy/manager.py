@@ -23,8 +23,8 @@ Module defines a standard Python logging module log 'AMI'
 """
 
 import sys
-from starpy._async import protocol, reactor, defer, basic
-from starpy._async import error as tw_error
+from starpy._aio import protocol, defer, basic, connect_tcp
+from starpy._aio import error as tw_error
 import socket
 import logging
 from hashlib import md5
@@ -1128,8 +1128,8 @@ class AMIFactory(protocol.ReconnectingClientFactory):
         large numbers of protocols simultaneously
         """
         self.loginDefer = defer.Deferred()
-        reactor.connectTCP(ip, port, self, timeout=timeout,
-                           bindAddress=bindAddress)
+        connect_tcp(ip, port, self, timeout=timeout,
+                    bindAddress=bindAddress)
         return self.loginDefer
 
     def clientConnectionFailed(self, connector, reason):

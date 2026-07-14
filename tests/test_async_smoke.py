@@ -3,7 +3,7 @@
 
 Exercises the two protocols starpy ships -- the AMI client (manager.py) and the
 FastAGI server (fastagi.py) -- end to end over real loopback TCP, driven only by
-``starpy._async`` and the standard library. It imports NO Twisted and NONE of the
+``starpy._aio`` and the standard library. It imports NO Twisted and NONE of the
 Asterisk test suite, proving starpy stands on its own after the cutover.
 
 Coverage (matches the exit criterion in 03-implementation.md Section 4.4: AMI
@@ -11,7 +11,7 @@ runs an action, FastAGI completes a simple dialog, reconnect parity holds):
 
   * AMI action -- AMIFactory.login() connects, the protocol auto-logs-in, then we
     issue a real ``ping`` action and assert the Success response comes back.
-  * FastAGI dialog -- reactor.listenTCP() serves a FastAGIFactory; a stub Asterisk
+  * FastAGI dialog -- listen_tcp() serves a FastAGIFactory; a stub Asterisk
     client sends the AGI variable block, the handler issues ``ANSWER`` and we
     assert the ``200 result=0`` reply is parsed to the integer 0.
   * AMI reconnect -- the stub manager drops the connection right after login; we
@@ -31,7 +31,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from starpy import manager, fastagi
-from starpy._async import reactor
+from starpy._aio import listen_tcp
 
 # Fail loudly if anything dragged Twisted in.
 assert 'twisted' not in sys.modules, "Twisted must not be importable via starpy"
@@ -138,7 +138,7 @@ async def _run_fastagi_dialog():
 
         d.addBoth(done)
 
-    port_handle = reactor.listenTCP(0, fastagi.FastAGIFactory(main_function))
+    port_handle = listen_tcp(0, fastagi.FastAGIFactory(main_function))
     for _ in range(200):
         if port_handle._server is not None:
             break

@@ -25,8 +25,8 @@ the server is listening.
 
 Module defines a standard Python logging module log 'FastAGI'
 """
-from starpy._async import protocol, reactor, defer, basic
-from starpy._async import error as tw_error
+from starpy._aio import protocol, defer, basic, call_later
+from starpy._aio import error as tw_error
 import logging
 import time
 from starpy import error
@@ -932,7 +932,7 @@ class FastAGIProtocol(basic.LineOnlyReceiver):
         passed
         """
         df = defer.Deferred()
-        reactor.callLater(duration, df.callback, 0)
+        call_later(duration, df.callback, 0)
         return df
 
 

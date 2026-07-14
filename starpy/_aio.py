@@ -1,40 +1,32 @@
-"""Self-contained asyncio compatibility shim for the starpy fork.
+"""Native asyncio primitives for the Twisted-free starpy fork.
 
-starpy historically imported Twisted::
+This module supersedes the ``starpy._async`` compatibility shim. It keeps the
+two pieces of that shim starpy genuinely relies on -- the chainable *and*
+awaitable ``Deferred``/``Failure`` result type, and the ``LineOnlyReceiver``
+line-framing protocol base -- and drops the emulated Twisted ``reactor``
+entirely. Connecting, listening and delayed calls run directly on the caller's
+*running* event loop via the standard library:
 
-    from twisted.internet import protocol, reactor, defer
-    from twisted.protocols import basic
-    from twisted.internet import error as tw_error
+  * ``connect_tcp(host, port, factory, ...)``  -> loop.create_connection
+  * ``listen_tcp(port, factory, ...)``         -> loop.create_server
+  * ``call_later(delay, fn, *args)``           -> loop.call_later
 
-The Twisted removal (design doc doc/untwist/, Section 4) replaces those imports
-with this module, which reproduces the small Twisted surface starpy actually
-drives -- Deferred/maybeDeferred, a reconnecting client factory, a plain server
-factory, a LineOnlyReceiver, an asyncio-backed reactor (connectTCP/callLater),
-and the ConnectionDone error type -- as thin wrappers over ``asyncio``.
-
-Why a *separate* shim rather than importing ``asterisk.aio``:
-
-  * starpy ships as its own installable package (``pip install starpy``) and must
-    not gain a runtime dependency on the Asterisk test suite. This module is
-    therefore self-contained: it imports only the standard library.
+Why keep a starpy-local ``Deferred`` rather than plain coroutines: the Asterisk
+test suite drives starpy through ~180 fire-and-forget ``.addCallback`` /
+``.addErrback`` chains (e.g. ``ami.originate(...).addErrback(handler)``) as well
+as ``await`` sites. A chainable+awaitable Deferred satisfies both without any
+churn in the test corpus. It is pure standard library, so the no-Twisted gate
+(which bans only ``twisted``/``txaio``/``autobahn`` imports) passes.
 
 Cross-shim interoperability with ``asterisk.aio`` (they meet whenever the suite
-drives starpy) is preserved by two conventions copied verbatim from that layer:
+drives starpy) is preserved by two conventions:
 
-  * a Failure marks itself with the class attribute ``_is_failure = True`` so the
-    other shim's callback chains route a foreign Failure to the errback branch
-    without importing one concrete class;
-  * a Deferred exposes ``addBoth`` so the other shim can pause its chain on ours.
+  * a Failure marks itself with ``_is_failure = True`` so a foreign Failure is
+    routed to the errback branch without importing a concrete class;
+  * a Deferred exposes ``addBoth`` so the other layer can pause its chain on ours.
 
-Both shims obtain the event loop via ``asyncio.get_running_loop()`` first, so when
-starpy is embedded in the running suite they share the one loop. The reactor here
-also schedules network binds immediately whenever *any* loop is running -- even if
-this module's own ``reactor.run()`` was never called -- so starpy works while the
-suite (not starpy) owns the loop.
-
-This module mirrors the structure and semantics of ``asterisk.aio`` (defer.py,
-failure.py, reactor.py, protocols.py); see doc/untwist/02-design.md for the
-rationale behind the Future-wrapper Deferred and resource-owned shutdown.
+Everything obtains the loop via ``asyncio.get_running_loop()`` first, so an
+embedded starpy shares the suite's single loop.
 """
 
 import asyncio
@@ -137,7 +129,7 @@ def _is_deferred_like(obj):
 
 
 class Deferred(object):
-    """Twisted-style Deferred backed by an explicit callback chain.
+    """Chainable + awaitable result, backed by an explicit callback chain.
 
     Wraps mutable chain state (rather than subclassing asyncio.Future) so that a
     callback added after firing still threads the current result, and exposes
@@ -420,13 +412,13 @@ class ConnectionLost(Exception):
 
 
 # ============================================================================ #
-# Protocol base classes (mirror of twisted.internet.protocol / protocols.basic)
+# Protocol base classes (line framing, native)
 # ============================================================================ #
 class Protocol(object):
-    """Minimal twisted.internet.protocol.Protocol surface.
+    """Minimal protocol surface driven by the transport adapter.
 
     ``makeConnection`` stores the transport and calls ``connectionMade``; the
-    reactor adapter drives ``dataReceived`` / ``connectionLost``.
+    adapter drives ``dataReceived`` / ``connectionLost``.
     """
 
     transport = None
@@ -449,7 +441,7 @@ class Protocol(object):
 
 
 class LineOnlyReceiver(Protocol):
-    """Twisted's basic.LineOnlyReceiver ported to the asyncio adapter.
+    """Line-oriented protocol base (Twisted basic.LineOnlyReceiver semantics).
 
     Splits the incoming byte stream on ``delimiter`` and calls
     ``lineReceived(line)`` for each complete line; ``sendLine(line)`` appends the
@@ -492,13 +484,13 @@ class LineOnlyReceiver(Protocol):
             self.transport.loseConnection()
 
     def clearLineBuffer(self):
-        """Discard and return any buffered partial line (Twisted parity)."""
+        """Discard and return any buffered partial line."""
         b, self._buffer = self._buffer, b''
         return b
 
 
 class Factory(object):
-    """twisted.internet.protocol.Factory: builds a protocol per connection."""
+    """Builds a protocol instance per connection."""
 
     protocol = None
 
@@ -519,7 +511,7 @@ class Factory(object):
 
 
 class ClientFactory(Factory):
-    """twisted.internet.protocol.ClientFactory: adds connection callbacks."""
+    """Adds client connection lifecycle callbacks."""
 
     def clientConnectionFailed(self, connector, reason):
         """Called when a connection attempt fails (override as needed)."""
@@ -529,11 +521,11 @@ class ClientFactory(Factory):
 
 
 class ReconnectingClientFactory(ClientFactory):
-    """twisted.internet.protocol.ReconnectingClientFactory.
+    """Reconnects with exponential backoff after a lost/failed connection.
 
-    Reconnects with exponential backoff after a lost/failed connection. starpy's
-    AMIFactory subclasses this and calls ``resetDelay()`` on a good connection and
-    ``retry(connector)`` on loss.
+    starpy's AMIFactory subclasses this and calls ``resetDelay()`` on a good
+    connection and ``retry(connector)`` on loss. The reconnect timer runs on the
+    caller's running loop via ``call_later`` (no reactor).
     """
 
     maxDelay = 3600
@@ -575,7 +567,7 @@ class ReconnectingClientFactory(ClientFactory):
             import random
             self.delay = random.normalvariate(self.delay,
                                                self.delay * self.jitter)
-        self._callID = reactor.callLater(self.delay, connector.connect)
+        self._callID = call_later(self.delay, connector.connect)
 
     def stopTrying(self):
         """Abandon reconnection attempts."""
@@ -596,151 +588,42 @@ class ReconnectingClientFactory(ClientFactory):
 
 
 # ============================================================================ #
-# Reactor (mirror of asterisk.aio.reactor, self-contained)
+# Transport adapters (native asyncio.Protocol <-> starpy Protocol surface)
 # ============================================================================ #
-class ReactorNotRunning(Exception):
-    """stop() called when the reactor is not running (twisted parity)."""
+class _TCPTransportAdapter(object):
+    """Expose the small transport surface starpy protocols use over TCP."""
+
+    def __init__(self, transport):
+        self._transport = transport
+
+    def write(self, data):
+        self._transport.write(data)
+
+    def writeSequence(self, seq):
+        self._transport.writelines(seq)
+
+    def loseConnection(self):
+        self._transport.close()
+
+    def getPeer(self):
+        return self._transport.get_extra_info('peername')
+
+    def getHost(self):
+        return self._transport.get_extra_info('sockname')
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
 
 
-class ReactorAlreadyRunning(Exception):
-    """run() called when the reactor is already running (twisted parity)."""
+class _ProtocolAdapter(asyncio.Protocol):
+    """Drive a starpy Protocol from asyncio.Protocol callbacks.
 
-
-class AlreadyCalled(Exception):
-    """_DelayedCall.cancel() when the call already fired."""
-
-
-class AlreadyCancelled(Exception):
-    """_DelayedCall.cancel() when already cancelled."""
-
-
-class _DelayedCall(object):
-    """Cancellable scheduled call (twisted.internet.base.DelayedCall)."""
-
-    def __init__(self, reactor, delay, fn, args, kw):
-        self._reactor = reactor
-        self._delay = delay
-        self._fn = fn
-        self._args = args
-        self._kw = kw
-        self._cancelled = False
-        self._called = False
-        self._handle = reactor._loop.call_later(delay, self._fire)
-
-    def _fire(self):
-        self._called = True
-        self._reactor._delayed_calls.discard(self)
-        self._fn(*self._args, **self._kw)
-
-    def active(self):
-        return not (self._cancelled or self._called)
-
-    def cancel(self):
-        if self._called:
-            raise AlreadyCalled()
-        if self._cancelled:
-            raise AlreadyCancelled()
-        self._cancelled = True
-        self._handle.cancel()
-        self._reactor._delayed_calls.discard(self)
-
-    def reset(self, delay):
-        if not self.active():
-            raise AlreadyCalled()
-        self._handle.cancel()
-        self._delay = delay
-        self._handle = self._reactor._loop.call_later(delay, self._fire)
-
-    def delay(self, seconds_later):
-        self.reset(self._delay + seconds_later)
-
-
-class _Port(object):
-    """Handle for a listening TCP endpoint (twisted IListeningPort)."""
-
-    def __init__(self):
-        self._transport = None
-        self._server = None
-        self._closed = False
-
-    def _set_server(self, server):
-        if self._closed and server is not None:
-            server.close()
-            return
-        self._server = server
-
-    def stopListening(self):
-        self._closed = True
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
-        if self._server is not None:
-            self._server.close()
-            self._server = None
-
-
-class _Connector(object):
-    """Handle for an outgoing TCP connection (twisted IConnector).
-
-    Supports reconnection: on an established-then-lost connection the adapter
-    notifies the factory via ``clientConnectionLost``; the factory's ``retry``
-    calls ``connect()`` again. Honors ``timeout`` and ``bindAddress`` per attempt.
+    The wrapped protocol comes from ``factory.buildProtocol(addr)`` and exposes
+    ``makeConnection``/``dataReceived``/``connectionLost``. For *client*
+    connections (connect_tcp) an established-then-lost connection notifies the
+    factory so a ReconnectingClientFactory can retry; server connections
+    (listen_tcp) have no connector and are not given clientConnectionLost.
     """
-
-    def __init__(self, reactor, host, port, factory, timeout, bindAddress):
-        self._reactor = reactor
-        self.host = host
-        self.port = port
-        self._factory = factory
-        self._timeout = timeout
-        self._bindAddress = bindAddress
-        self._transport = None
-        self._stopped = False
-
-    def connect(self):
-        if self._stopped:
-            return
-        self._transport = None
-        factory = self._factory
-        if hasattr(factory, 'startedConnecting'):
-            factory.startedConnecting(self)
-        loop = self._reactor._ensure_loop()
-        local_addr = self._bindAddress if self._bindAddress else None
-        coro = loop.create_connection(
-            lambda: _TwistedProtocolAdapter(factory, self),
-            self.host, self.port, local_addr=local_addr)
-        if self._timeout:
-            coro = asyncio.wait_for(coro, self._timeout)
-
-        def apply(result):
-            transport, _proto = result
-            self._transport = transport
-
-        def on_error(exc):
-            if self._stopped:
-                return
-            if hasattr(factory, 'clientConnectionFailed'):
-                factory.clientConnectionFailed(self, Failure(exc))
-
-        self._reactor._register_bind(
-            coro, apply, on_error,
-            'connectTCP:%s:%d' % (self.host, self.port))
-
-    def stopConnecting(self):
-        self.disconnect()
-
-    def disconnect(self):
-        self._stopped = True
-        factory = self._factory
-        if hasattr(factory, 'stopTrying'):
-            factory.stopTrying()
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
-
-
-class _TwistedProtocolAdapter(asyncio.Protocol):
-    """Drive a Twisted-style protocol from asyncio.Protocol callbacks."""
 
     def __init__(self, factory, connector=None):
         self._factory = factory
@@ -774,261 +657,145 @@ class _TwistedProtocolAdapter(asyncio.Protocol):
                 self._factory.clientConnectionLost(connector, reason)
 
 
-class _TCPTransportAdapter(object):
-    """Expose the twisted ITransport surface used by protocols over TCP."""
-
-    def __init__(self, transport):
-        self._transport = transport
-
-    def write(self, data):
-        self._transport.write(data)
-
-    def writeSequence(self, seq):
-        self._transport.writelines(seq)
-
-    def loseConnection(self):
-        self._transport.close()
-
-    def getPeer(self):
-        return self._transport.get_extra_info('peername')
-
-    def getHost(self):
-        return self._transport.get_extra_info('sockname')
-
-    def __getattr__(self, name):
-        return getattr(self._transport, name)
-
-
-class _Reactor(object):
-    """asyncio-backed stand-in for twisted.internet.reactor (starpy subset)."""
+# ============================================================================ #
+# Connect / listen / delayed-call primitives (running-loop, no reactor)
+# ============================================================================ #
+class _Port(object):
+    """Handle for a listening TCP endpoint."""
 
     def __init__(self):
-        self.running = False
-        self._loop = None
-        self._when_running = []
-        self._pending_binds = []
-        self._stop_future = None
-        self._failure = None
-        self._delayed_calls = set()
-        self._tasks = set()
-        self._ports = []
-        self._connectors = []
+        self._transport = None
+        self._server = None
+        self._closed = False
 
-    def _ensure_loop(self):
-        # Prefer the running loop so an embedded starpy shares the suite's loop.
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            if self._loop is None:
-                self._loop = asyncio.get_event_loop_policy().get_event_loop()
-        return self._loop
-
-    # -- lifecycle -------------------------------------------------------- #
-    def run(self, installSignalHandlers=True):
-        if self.running:
-            raise ReactorAlreadyRunning()
-        loop = self._ensure_loop()
-        if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            self._loop = loop
-        self.running = True
-        self._failure = None
-        self._stop_future = loop.create_future()
-
-        pending = self._pending_binds
-        self._pending_binds = []
-        for coro, apply, on_error, label in pending:
-            try:
-                result = loop.run_until_complete(coro)
-            except Exception as exc:
-                if on_error is not None:
-                    on_error(exc)
-                    continue
-                self.running = False
-                self._failure = exc
-                loop.run_until_complete(self._shutdown())
-                self._stop_future = None
-                raise
-            apply(result)
-
-        queued = self._when_running
-        self._when_running = []
-        for fn, args, kw in queued:
-            loop.call_soon(fn, *args, **kw)
-
-        try:
-            loop.run_until_complete(self._stop_future)
-        finally:
-            self.running = False
-            loop.run_until_complete(self._shutdown())
-            self._stop_future = None
-
-        if self._failure is not None:
-            failure = self._failure
-            self._failure = None
-            raise failure
-
-    def stop(self):
-        if not self.running:
+    def _set_server(self, server):
+        if self._closed and server is not None:
+            server.close()
             return
-        self.running = False
-        fut = self._stop_future
+        self._server = server
 
-        def _resolve():
-            if fut is not None and not fut.done():
-                fut.set_result(None)
+    def stopListening(self):
+        self._closed = True
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
+        if self._server is not None:
+            self._server.close()
+            self._server = None
 
-        self._loop.call_soon_threadsafe(_resolve)
 
-    async def _shutdown(self):
-        for dc in list(self._delayed_calls):
-            if dc.active():
-                dc.cancel()
-        self._delayed_calls.clear()
+class _Connector(object):
+    """Handle for an outgoing TCP connection with reconnect support.
 
-        for port in list(self._ports):
-            port.stopListening()
-        self._ports.clear()
-        for connector in list(self._connectors):
-            connector.disconnect()
-        self._connectors.clear()
+    On an established-then-lost connection the adapter notifies the factory via
+    ``clientConnectionLost``; the factory's ``retry`` calls ``connect()`` again.
+    Honors ``timeout`` and ``bindAddress`` per attempt. Runs on the caller's
+    running loop.
+    """
 
-        for task in list(self._tasks):
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+    def __init__(self, host, port, factory, timeout, bindAddress):
+        self.host = host
+        self.port = port
+        self._factory = factory
+        self._timeout = timeout
+        self._bindAddress = bindAddress
+        self._transport = None
+        self._stopped = False
 
-        try:
-            current = asyncio.current_task(self._loop)
-            stragglers = [t for t in asyncio.all_tasks(self._loop)
-                          if t is not current and not t.done()]
-        except RuntimeError:
-            stragglers = []
-        for task in stragglers:
-            task.cancel()
-        if stragglers:
-            await asyncio.gather(*stragglers, return_exceptions=True)
+    def connect(self):
+        if self._stopped:
+            return
+        self._transport = None
+        factory = self._factory
+        if hasattr(factory, 'startedConnecting'):
+            factory.startedConnecting(self)
+        loop = _get_loop()
+        local_addr = self._bindAddress if self._bindAddress else None
+        coro = loop.create_connection(
+            lambda: _ProtocolAdapter(factory, self),
+            self.host, self.port, local_addr=local_addr)
+        if self._timeout:
+            coro = asyncio.wait_for(coro, self._timeout)
 
-        await asyncio.sleep(0)
+        task = asyncio.ensure_future(coro)
 
-    # -- scheduling ------------------------------------------------------- #
-    def callWhenRunning(self, fn, *args, **kw):
-        if self.running:
-            self._ensure_loop().call_soon(fn, *args, **kw)
-        else:
-            self._when_running.append((fn, args, kw))
-
-    def callLater(self, delay, fn, *args, **kw):
-        self._ensure_loop()
-        dc = _DelayedCall(self, delay, fn, args, kw)
-        self._delayed_calls.add(dc)
-        return dc
-
-    def callFromThread(self, fn, *args, **kw):
-        self._ensure_loop().call_soon_threadsafe(lambda: fn(*args, **kw))
-
-    def callInThread(self, fn, *args, **kw):
-        loop = self._ensure_loop()
-        deferred = Deferred()
-        fut = loop.run_in_executor(None, lambda: fn(*args, **kw))
-        self._tasks.add(fut)
-
-        def _done(f):
-            self._tasks.discard(f)
-            try:
-                deferred.callback(f.result())
-            except Exception:
-                deferred.errback(Failure())
-
-        fut.add_done_callback(_done)
-        return deferred
-
-    # -- networking ------------------------------------------------------- #
-    def listenTCP(self, port, factory, backlog=50, interface=''):
-        loop = self._ensure_loop()
-        handle = _Port()
-        self._ports.append(handle)
-        coro = loop.create_server(lambda: _TwistedProtocolAdapter(factory),
-                                  interface or '0.0.0.0', port,
-                                  backlog=backlog)
-
-        def apply(server):
-            handle._set_server(server)
-
-        self._register_bind(coro, apply, None, 'listenTCP:%d' % port)
-        return handle
-
-    def connectTCP(self, host, port, factory, timeout=30, bindAddress=None):
-        self._ensure_loop()
-        connector = _Connector(self, host, port, factory, timeout, bindAddress)
-        self._connectors.append(connector)
-        connector.connect()
-        return connector
-
-    # -- internal bind scheduling ----------------------------------------- #
-    def _register_bind(self, coro, apply, on_error, label):
-        """Bind now if a loop is running (even one this reactor doesn't own),
-        else queue for this reactor's own run() startup.
-
-        Scheduling on any running loop is what lets starpy operate while the
-        Asterisk suite -- not starpy -- owns the event loop.
-        """
-        try:
-            asyncio.get_running_loop()
-            loop_running = True
-        except RuntimeError:
-            loop_running = False
-
-        if self.running or loop_running:
-            task = asyncio.ensure_future(coro)
-            self._tasks.add(task)
-
-            def _done(t):
-                self._tasks.discard(t)
-                if t.cancelled():
+        def _done(t):
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                if self._stopped:
                     return
-                exc = t.exception()
-                if exc is not None:
-                    if on_error is not None:
-                        on_error(exc)
-                    else:
-                        self._fatal(exc)
-                    return
-                apply(t.result())
+                if hasattr(factory, 'clientConnectionFailed'):
+                    factory.clientConnectionFailed(self, Failure(exc))
+                return
+            transport, _proto = t.result()
+            self._transport = transport
 
-            task.add_done_callback(_done)
-        else:
-            self._pending_binds.append((coro, apply, on_error, label))
+        task.add_done_callback(_done)
 
-    def _fatal(self, exc):
-        if self._failure is None:
-            self._failure = exc
-        if self.running:
-            try:
-                self.stop()
-            except ReactorNotRunning:
-                pass
+    def stopConnecting(self):
+        self.disconnect()
+
+    def disconnect(self):
+        self._stopped = True
+        factory = self._factory
+        if hasattr(factory, 'stopTrying'):
+            factory.stopTrying()
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
 
 
-# Module-level singleton, mirroring ``from twisted.internet import reactor``.
-reactor = _Reactor()
+def connect_tcp(host, port, factory, timeout=30, bindAddress=None):
+    """Open a client TCP connection, building a protocol from ``factory``.
+
+    Returns a connector supporting reconnection through a
+    ReconnectingClientFactory. Runs on the caller's running loop.
+    """
+    connector = _Connector(host, port, factory, timeout, bindAddress)
+    connector.connect()
+    return connector
+
+
+def listen_tcp(port, factory, backlog=50, interface=''):
+    """Listen for TCP connections, building protocols from ``factory``.
+
+    Returns a ``_Port`` handle whose ``_server`` is set once the bind completes.
+    Runs on the caller's running loop.
+    """
+    loop = _get_loop()
+    handle = _Port()
+    coro = loop.create_server(lambda: _ProtocolAdapter(factory),
+                              interface or '0.0.0.0', port, backlog=backlog)
+    task = asyncio.ensure_future(coro)
+
+    def _done(t):
+        if t.cancelled():
+            return
+        if t.exception() is not None:
+            raise t.exception()
+        handle._set_server(t.result())
+
+    task.add_done_callback(_done)
+    return handle
+
+
+def call_later(delay, fn, *args, **kw):
+    """Schedule ``fn(*args, **kw)`` after ``delay`` seconds on the running loop.
+
+    Returns the asyncio ``TimerHandle`` (has a ``.cancel()`` method), so callers
+    that hold the handle can cancel a pending call.
+    """
+    loop = _get_loop()
+    if kw:
+        return loop.call_later(delay, lambda: fn(*args, **kw))
+    return loop.call_later(delay, fn, *args)
 
 
 # ============================================================================ #
-# Twisted-shaped import namespaces
+# Import namespaces (drop-in for the retired starpy._async namespaces)
 # ============================================================================ #
-# starpy replaces
-#   from twisted.internet import protocol, reactor, defer
-#   from twisted.protocols import basic
-#   from twisted.internet import error as tw_error
-# with
-#   from starpy._async import protocol, reactor, defer, basic
-#   from starpy._async import error as tw_error
-# These SimpleNamespace objects reproduce the referenced attributes so the module
-# bodies (defer.Deferred, protocol.ReconnectingClientFactory, basic.LineOnlyReceiver,
-# tw_error.ConnectionDone, ...) resolve unchanged.
 defer = types.SimpleNamespace(
     Deferred=Deferred,
     DeferredList=DeferredList,
