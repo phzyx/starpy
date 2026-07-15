@@ -1,25 +1,20 @@
-"""Native asyncio primitives for the Twisted-free starpy fork.
+"""Native asyncio primitives for starpy.
 
-This module supersedes the ``starpy._async`` compatibility shim. It keeps the
-two pieces of that shim starpy genuinely relies on -- the chainable *and*
-awaitable ``Deferred``/``Failure`` result type, and the ``LineOnlyReceiver``
-line-framing protocol base -- and drops the emulated Twisted ``reactor``
-entirely. Connecting, listening and delayed calls run directly on the caller's
-*running* event loop via the standard library:
+This module provides the two asynchronous building blocks starpy relies on: the
+chainable *and* awaitable ``Deferred``/``Failure`` result type, and the
+``LineOnlyReceiver`` line-framing protocol base. Connecting, listening and
+delayed calls run directly on the caller's *running* event loop via the standard
+library:
 
   * ``connect_tcp(host, port, factory, ...)``  -> loop.create_connection
   * ``listen_tcp(port, factory, ...)``         -> loop.create_server
   * ``call_later(delay, fn, *args)``           -> loop.call_later
 
-Why keep a starpy-local ``Deferred`` rather than plain coroutines: the Asterisk
-test suite drives starpy through ~180 fire-and-forget ``.addCallback`` /
-``.addErrback`` chains (e.g. ``ami.originate(...).addErrback(handler)``) as well
-as ``await`` sites. A chainable+awaitable Deferred satisfies both without any
-churn in the test corpus. It is pure standard library, so the no-Twisted gate
-(which bans only ``twisted``/``txaio``/``autobahn`` imports) passes.
+Starpy exposes a chainable+awaitable ``Deferred`` because callers use both
+fire-and-forget ``.addCallback`` / ``.addErrback`` chains and ``await`` sites.
 
-Cross-shim interoperability with ``asterisk.aio`` (they meet whenever the suite
-drives starpy) is preserved by two conventions:
+Cross-package interoperability with ``asterisk.aio`` is preserved by two
+conventions:
 
   * a Failure marks itself with ``_is_failure = True`` so a foreign Failure is
     routed to the errback branch without importing a concrete class;
@@ -35,12 +30,12 @@ import types
 
 
 # ============================================================================ #
-# Failure (mirror of asterisk.aio.failure.Failure)
+# Failure
 # ============================================================================ #
 class Failure(object):
     """Wraps an exception for transport through Deferred errback chains."""
 
-    # Cross-shim marker: recognised by asterisk.aio's _is_failure duck-test.
+    # Cross-package marker: recognised by asterisk.aio's _is_failure duck-test.
     _is_failure = True
 
     def __init__(self, exc=None, exc_type=None, tb=None):
@@ -96,14 +91,14 @@ class Failure(object):
 
 
 # ============================================================================ #
-# Deferred (mirror of asterisk.aio.defer)
+# Deferred
 # ============================================================================ #
 class AlreadyCalledError(Exception):
     """callback()/errback() invoked on an already-fired Deferred."""
 
 
 class TimeoutError(Exception):
-    """twisted.internet.defer.TimeoutError."""
+    """Deferred operation timed out."""
 
 
 def _passthrough(result):
@@ -119,7 +114,7 @@ def _get_loop():
 
 
 def _is_failure(obj):
-    """True if ``obj`` is a Failure from this or any compatible shim."""
+    """True if ``obj`` is a Failure-compatible object."""
     return getattr(obj, '_is_failure', False) is True
 
 
@@ -131,8 +126,8 @@ def _is_deferred_like(obj):
 class Deferred(object):
     """Chainable + awaitable result, backed by an explicit callback chain.
 
-    Wraps mutable chain state (rather than subclassing asyncio.Future) so that a
-    callback added after firing still threads the current result, and exposes
+    Wraps mutable chain state so that a callback added after firing still
+    threads the current result, and exposes
     ``__await__`` over an idle event so ``await d`` observes the latest result.
     """
 
@@ -401,14 +396,14 @@ def maybeDeferred(f, *args, **kw):
 
 
 # ============================================================================ #
-# Errors (mirror of twisted.internet.error subset)
+# Errors used by starpy protocol code
 # ============================================================================ #
 class ConnectionDone(Exception):
-    """Connection closed cleanly (twisted.internet.error.ConnectionDone)."""
+    """Connection closed cleanly."""
 
 
 class ConnectionLost(Exception):
-    """Connection lost unexpectedly (twisted.internet.error.ConnectionLost)."""
+    """Connection lost unexpectedly."""
 
 
 # ============================================================================ #
@@ -441,7 +436,7 @@ class Protocol(object):
 
 
 class LineOnlyReceiver(Protocol):
-    """Line-oriented protocol base (Twisted basic.LineOnlyReceiver semantics).
+    """Line-oriented protocol base.
 
     Splits the incoming byte stream on ``delimiter`` and calls
     ``lineReceived(line)`` for each complete line; ``sendLine(line)`` appends the
@@ -525,7 +520,7 @@ class ReconnectingClientFactory(ClientFactory):
 
     starpy's AMIFactory subclasses this and calls ``resetDelay()`` on a good
     connection and ``retry(connector)`` on loss. The reconnect timer runs on the
-    caller's running loop via ``call_later`` (no reactor).
+    caller's running loop via ``call_later``.
     """
 
     maxDelay = 3600
@@ -658,7 +653,7 @@ class _ProtocolAdapter(asyncio.Protocol):
 
 
 # ============================================================================ #
-# Connect / listen / delayed-call primitives (running-loop, no reactor)
+# Connect / listen / delayed-call primitives (running-loop)
 # ============================================================================ #
 class _Port(object):
     """Handle for a listening TCP endpoint."""
@@ -794,7 +789,7 @@ def call_later(delay, fn, *args, **kw):
 
 
 # ============================================================================ #
-# Import namespaces (drop-in for the retired starpy._async namespaces)
+# Import namespaces matching the shapes used by starpy's protocol modules.
 # ============================================================================ #
 defer = types.SimpleNamespace(
     Deferred=Deferred,

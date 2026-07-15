@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Isolated smoke test for the Twisted-free starpy fork (design doc Section 4.4).
+"""Isolated smoke test for starpy's asyncio protocol helpers.
 
 Exercises the two protocols starpy ships -- the AMI client (manager.py) and the
 FastAGI server (fastagi.py) -- end to end over real loopback TCP, driven only by
-``starpy._aio`` and the standard library. It imports NO Twisted and NONE of the
-Asterisk test suite, proving starpy stands on its own after the cutover.
+``starpy._aio`` and the standard library. It does not import the Asterisk test
+suite or any external event framework, proving starpy stands on its own.
 
-Coverage (matches the exit criterion in 03-implementation.md Section 4.4: AMI
-runs an action, FastAGI completes a simple dialog, reconnect parity holds):
+Coverage (AMI runs an action, FastAGI completes a simple dialog, reconnect
+behavior holds):
 
   * AMI action -- AMIFactory.login() connects, the protocol auto-logs-in, then we
     issue a real ``ping`` action and assert the Success response comes back.
@@ -33,8 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from starpy import manager, fastagi
 from starpy._aio import listen_tcp
 
-# Fail loudly if anything dragged Twisted in.
-assert 'twisted' not in sys.modules, "Twisted must not be importable via starpy"
+# Fail loudly if an external event framework is pulled in.
+assert 'twisted' not in sys.modules, "unexpected external event framework import"
 
 
 # --------------------------------------------------------------------------- #
@@ -261,7 +261,7 @@ def _run_ami_disconnect_cleanup():
 
 
 async def _main():
-    print("starpy Twisted-free smoke test")
+    print("starpy asyncio smoke test")
     _run_ami_disconnect_cleanup()
     await _run_ami_action()
     await _run_fastagi_dialog()

@@ -1,5 +1,5 @@
 #
-# StarPy -- Asterisk Protocols for Twisted
+# StarPy -- Asterisk protocol helpers
 #
 # Copyright (c) 2006, Michael C. Fletcher
 #
